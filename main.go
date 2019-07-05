@@ -5,27 +5,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"syscall"
 )
-
-type task interface {
-	execute(lines chan string)
-}
-
-type loadTask struct {
-}
-
-func (l loadTask) execute(lines chan string) {
-	line := <-lines
-	fmt.Println("load", line)
-}
 
 type minecraftd struct {
 	proc   *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
-	tasks  chan task
+	tasks  chan Task
 	lines  chan string
 }
 
@@ -58,7 +49,7 @@ func (m *minecraftd) stdoutParser() {
 	close(m.lines)
 }
 
-func (m *minecraftd) addTask(t task) {
+func (m *minecraftd) addTask(t Task) {
 	m.tasks <- t
 }
 
@@ -68,19 +59,40 @@ func (m *minecraftd) taskExecutor() {
 		case task := <-m.tasks:
 			// When we receive a new task, pass the control flow to the task and it can use
 			// the lines channel as it sees fit. Thus, it gains exclusive access to the lines.
-			task.execute(m.lines)
+			stop, err := task.Execute(m.lines, m.stdin)
+			if err != nil {
+				log.Println("Error during task execution:", err)
+				break
+			}
+			if stop {
+				log.Println("Task has asked to stop the task executor")
+				break
+			}
 		case line, ok := <-m.lines:
 			if !ok {
 				break
 			}
 			// No task is executing and we receive a line, just ignore it.
-			fmt.Println("dumped", len(line), line)
+			_ = line
 		}
 	}
 }
 
+func (m *minecraftd) signalHandler() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	log.Println("Caught interrupt, queuing stop task.")
+	m.addTask(NewStopTask())
+}
+
 func spawnMinecraftProcess() error {
-	cmd := exec.Command("ls", "-l")
+	cmd := exec.Command("java", "-jar", "server.jar", "nogui")
+	cmd.Dir = "world"
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+		Pgid:    0,
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -100,15 +112,15 @@ func spawnMinecraftProcess() error {
 		cmd,
 		stdin,
 		stdout,
-		make(chan task, 1000),
+		make(chan Task, 1000),
 		make(chan string, 1000),
 	}
 
-	m.addTask(loadTask{})
-	m.addTask(loadTask{})
+	m.addTask(NewLoadTask())
 
 	go m.stdoutParser()
 	go m.taskExecutor()
+	go m.signalHandler()
 
 	if err := cmd.Wait(); err != nil {
 		return err
